@@ -1,8 +1,8 @@
 # Reinforcement Learning Scheduler for Solar-Powered Edge Devices
 ## Authors :pencil2:
-- Author 1
-- Author 2
-- Author 3
+- Luca Giovannesi
+- Paolo Russo
+- Roberto Beraldi
 ## Abstract :page_facing_up:
 Edge devices powered by renewable energy sources,
 such as solar panels, face the challenge of operating under uncertain and intermittent energy availability. This paper
