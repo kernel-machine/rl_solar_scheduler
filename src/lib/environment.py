@@ -29,7 +29,13 @@ class EnvBeeDay(gym.Env):
                  latent_size:int = 24,
                  train_days:int = 30,
                  start_threshold:float = 0.1,
-                 prevision_noise_amount:float = 0.2
+                 prevision_noise_amount:float = 0.2,
+                 only_day_acquisition:bool = False,
+                 battery_weight:float = 1.0,
+                 buffer_weight:float = 1.0,
+                 random_day_switch:bool = False,
+                 discrete_action:bool = False,
+                 reward_shape:int = 1
                    ):
         self.state_content = state_content
         self.random_reset = random_reset
@@ -46,6 +52,12 @@ class EnvBeeDay(gym.Env):
         self.train_days = train_days
         self.start_threshold = start_threshold
         self.prevision_noise_amount = prevision_noise_amount
+        self.only_day_acquisition = only_day_acquisition
+        self.battery_weight = battery_weight
+        self.buffer_weight = buffer_weight
+        self.random_day_switch = random_day_switch
+        self.discrete_action = discrete_action
+        self.reward_shape = reward_shape
 
         self.rng = random.Random(seed)
         torch.manual_seed(seed)
@@ -57,7 +69,7 @@ class EnvBeeDay(gym.Env):
         self.time_s = 5*60
         self.boot_time_s = self.time_s
         self.step_size_s = step_s
-        self.max_buffer_size = self.step_size_s*acquistion_speed_fps*20
+        self.max_buffer_size = self.step_size_s*acquistion_speed_fps*60*5
         if self.state_content & StateContent.NEXT_DAY or self.state_content & StateContent.DAY_AVG:
             self.max_avg_day = self.solar.max_power_w#max(self.solar.get_day_avg(x) for x in range(366))
         self.device_idle_energy_w = device_idle_energy_w
@@ -79,7 +91,10 @@ class EnvBeeDay(gym.Env):
         if choose_forecast:
             self.action_space = gym.spaces.Box(low=0,high=1,shape=(3,),dtype=float)
         else:
-            self.action_space = gym.spaces.Box(low=0, high=1, shape=(1,), dtype=float)
+            if self.discrete_action:
+                self.action_space = gym.spaces.Discrete(2) # 0: process all images, 1: process no images
+            else:
+                self.action_space = gym.spaces.Box(low=0, high=1, shape=(1,), dtype=float)
 
         self.reset()
 
@@ -88,15 +103,18 @@ class EnvBeeDay(gym.Env):
         # No random
         if (options is not None and options["norandom"] == True) or not self.random_reset:
             self.battery_curr_j = self.battery_max_j*0.3
+            self.buffer_length = 0
             if options is not None and options["day"] is not None:
                 day = options["day"]
             else:
                 day = self.selected_day
         else:
             self.battery_curr_j = self.battery_max_j*(self.rng.randint(3,7)/10)
+            #day = (300+self.rng.randint(0,120))%365
             day = self.rng.randint(0,self.train_days)
+            self.buffer_length = self.rng.randint(0,3*self.max_buffer_size//4)
 
-        if self.start_hour < 0:
+        if self.start_hour < 0 and self.start_threshold > 0:
             # Start with battery at least at {self.start_threshold}%
             self.battery_curr_j = 0
             self.time_s = day*24*60*60
@@ -106,13 +124,17 @@ class EnvBeeDay(gym.Env):
                 solar_energy_j = max(0,solar_power_w*self.step_size_s)
                 self.haversted_energy_j += solar_energy_j
                 self.battery_curr_j += solar_energy_j
+        elif self.start_hour < 0 and self.start_threshold <= 0:
+            # random start hour
+            self.start_hour = self.rng.randint(0,23)
+            self.time_s = (day*24+self.start_hour)*60*60
         else:
             self.time_s = (day*24+self.start_hour)*60*60
 
         self.boot_time_s = self.time_s
         self.processed_images = 0
         self.haversted_energy_j = self.battery_curr_j
-        self.buffer_length = 0
+        self.elapsed_time_s = 0
         
         obs, fields = self.__get_obs()
         return obs, {"fields":fields}
@@ -129,6 +151,7 @@ class EnvBeeDay(gym.Env):
         self.haversted_energy_j += solar_energy_j
         self.battery_curr_j += solar_energy_j
 
+        '''
         # Set when episode terminate
         if self.terminated_days > 1:
             # terminate after {self.terminated_days} days
@@ -140,15 +163,18 @@ class EnvBeeDay(gym.Env):
             terminated = True # Terminate at sunset
         else:
             terminated = False
-        
-        if solar_energy_j == 0 or terminated:
-            captured_images = 0
-        else:
-            captured_images = self.acquisition_speed_fps * self.step_size_s
+        '''
+        # if (solar_energy_j == 0 or terminated) and self.only_day_acquisition:
+        #     captured_images = 0
+        # else:
+        captured_images = self.acquisition_speed_fps * self.step_size_s
 
         processable_images = self.processing_speed_fps * self.step_size_s # Processable images must be > captured
 
-        action = action[0]
+        # Stable-Baselines can return either a scalar action (DQN/discrete)
+        # or a 1D array (Box policies). Normalize both cases to a scalar.
+        action = np.asarray(action).reshape(-1)[0]
+        
         processed_amount = round(action*processable_images)                                   # Images processed in the next interval
         processed_amount = min(processed_amount, self.buffer_length + captured_images)        # Processed images has as upper bound the buffered images
         
@@ -158,24 +184,66 @@ class EnvBeeDay(gym.Env):
             self.processed_images+=processed_amount
             buffered_amount = captured_images - processed_amount
             self.buffer_length += buffered_amount
-            reward = processed_amount
-        else: # Turned off
-            reward = -processable_images - self.buffer_length 
-                    
+            #reward = processed_amount
+        #else: # Turned off
+        #    reward = -processed_amount - self.buffer_length  
         self.battery_curr_j -= necessary_enegy_j
-
+        
+        #r_batt = -1/((max(0,self.battery_curr_j)/self.battery_max_j)+0.0001)
+        discarged_images = 0
         if self.buffer_length > self.max_buffer_size:
             discarged_images = self.buffer_length - self.max_buffer_size
-            reward -= discarged_images #Penalized if buffered images cannot be stored
+            #reward -= discarged_images #Penalized if buffered images cannot be stored
             self.buffer_length = self.max_buffer_size
 
-        reward /= processable_images
+        #reward /= processable_images
         done = self.battery_curr_j<=0
-        if self.terminated_days == 1:
-            done |= terminated
+        self.elapsed_time_s += self.step_size_s
+        terminated = self.elapsed_time_s >= self.terminated_days * 24 * 60 * 60
 
         self.battery_curr_j = max(0,min(self.battery_max_j, self.battery_curr_j))
+
+        #reward_buff = -1/(1-(self.buffer_length/self.max_buffer_size)+0.0001)
+        #reward_batt = -1/((self.battery_curr_j/self.battery_max_j)+0.0001)
+        #reward = 0.4*reward_buff# + 0.6*reward_batt
+        if self.reward_shape == 1:
+            reward = -self.battery_weight * abs(action - self.battery_curr_j/self.battery_max_j) - self.buffer_weight*self.buffer_length / self.max_buffer_size
+        elif self.reward_shape == 2:
+            reward = -self.battery_weight * abs(action - self.battery_curr_j/self.battery_max_j) - self.buffer_weight*(discarged_images/captured_images)
+        elif self.reward_shape == 3:
+            reward_elaborazione = processed_amount / processable_images  # Valore positivo tra 0 e 1
+            penalita_scarico = self.buffer_weight * (discarged_images / captured_images)
+            
+            # Se la batteria si azzera, applichiamo una forte penalità di morte
+            penalita_morte = 1.0 if done else 0.0 
+            
+            reward = reward_elaborazione - penalita_scarico - penalita_morte
+        elif self.reward_shape == 4:
+            buffer_level = self.buffer_length / self.max_buffer_size
+            battery_level = self.battery_curr_j / self.battery_max_j
+            processing_reward = processed_amount / processable_images
+            buffer_penalty = self.buffer_weight * (buffer_level ** 2)
+            battery_penalty = self.battery_weight * max(0, 0.2 - battery_level)
+            death_penalty = 10.0 if done else 0.0
+            reward = processing_reward - buffer_penalty - battery_penalty - death_penalty
+        else:
+            reward = 0
+
+        '''
+        action batt reward
+        0 0 0 good
+        0 1 -1 bad
+        1 0 1 bad
+        1 1 0 good
+        0.5 0.5 0
+        '''
+
+        prev_day = self.time_s // (24 * 60 * 60)
         self.time_s += self.step_size_s
+        new_day = self.time_s // (24 * 60 * 60)
+        if new_day != prev_day and self.random_reset and self.random_day_switch:
+            random_day = self.rng.randint(0, self.train_days)
+            self.time_s = random_day * 24 * 60 * 60
 
         obs, fields = self.__get_obs()
 
@@ -217,8 +285,12 @@ class EnvBeeDay(gym.Env):
             h = self.solar.get_datetime(self.time_s).hour #0-23
             m = self.solar.get_datetime(self.time_s).minute #0-59
             h+=m/60
-            arr.append(h/24)
-            fields.append("Hour Minute")
+            sin_h = np.sin(h / 24.0)
+            cos_h = np.cos(h / 24.0)
+            arr.append(sin_h)
+            arr.append(cos_h)
+            fields.append("Sin(Hour Minute)")
+            fields.append("Cos(Hour Minute)")
         if self.state_content & StateContent.DAY:
             arr.append(self.solar.get_datetime(self.time_s).timetuple().tm_yday/366)
             fields.append("Day")

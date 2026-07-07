@@ -26,7 +26,7 @@ from statistics import mean, stdev
 import signal
 import sys
 from tqdm import tqdm
-from ilp_solver import find_optimal_list
+
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from time import time
 from thop import profile, clever_format
@@ -58,12 +58,16 @@ def main():
     parser.add_argument("--use_quantize_day", default=False, action="store_true")
     parser.add_argument("--use_quantize_prev_day", default=False, action="store_true")
     parser.add_argument("--layer_width", default=64, type=int)
+    parser.add_argument("--layer_depth", default=2, type=int)
     parser.add_argument("--latent_size", default=24, type=int)
     parser.add_argument("--run_folder", default="../runs", type=str)
     parser.add_argument("--gpu", default=False, action="store_true")
     parser.add_argument("--val",default=False, action="store_true")
     parser.add_argument("--model",default=None, type=str)
     parser.add_argument("--lr",type=float, default=0.0003)
+    parser.add_argument("--gamma", type=float, default=0.995)
+    parser.add_argument("--device_idle_energy_w", type=float, default=2.5)
+    parser.add_argument("--device_full_energy_w", type=float, default=7.5)
     parser.add_argument("--lr_decay",default=None, choices=["exp","cos","lin","lin_half","lin_thirth"])
     parser.add_argument("--n_env", default=1, type=int, required=False)
     parser.add_argument("--term_days", default=1, type=int, required=False)
@@ -77,6 +81,13 @@ def main():
     parser.add_argument("--start_thr",type=float, default=0.1)
     parser.add_argument("--prevision_noise", type=float, default=0.1)
     parser.add_argument("--use_images", default=False, action="store_true")
+    parser.add_argument("--only_day_acquisition", default=False, action="store_true")
+    parser.add_argument("--battery_weight", type=float, default=1.0)
+    parser.add_argument("--buffer_weight", type=float, default=1.0)
+    parser.add_argument("--random_day_switch", default=False, action="store_true")
+    parser.add_argument("--discrete_action", default=False, action="store_true")
+    parser.add_argument("--reward_shape", type=int, default=1)
+
     args = parser.parse_args()
     SEED = 42
 
@@ -173,11 +184,12 @@ def main():
 
     device = torch.device("cuda:0") if args.gpu else torch.device("cpu")
 
-    panel_area_m2 = 1*0.55*0.51 #m2
+    panel_area_m2 = 2*0.55*0.51 #m2
     efficiency = 0.1426
-    max_power_w = 40 #W
-    solar2024 = Solar("../solcast2024.csv", scale_factor=panel_area_m2*efficiency, max_power=max_power_w, enable_cache=True, prediction_accuracy=args.prediction_accuracy)
-    solar2025 = Solar(f"../solcast{args.test_year}.csv", scale_factor=panel_area_m2*efficiency, max_power=max_power_w, enable_cache=True, prediction_accuracy=args.prediction_accuracy)
+    max_power_w = 80 #W
+    battery_wh = 24*12
+    solar2024 = Solar("../solcast2024_solar_only.csv", scale_factor=panel_area_m2*efficiency, max_power=max_power_w, enable_cache=True, prediction_accuracy=args.prediction_accuracy)
+    solar2025 = Solar(f"../solcast{args.test_year}_solar_only.csv", scale_factor=panel_area_m2*efficiency, max_power=max_power_w, enable_cache=True, prediction_accuracy=args.prediction_accuracy)
 
     start_hour = -1 if args.autostart else 7
     end_hour = -1 if args.autostart else 18
@@ -189,8 +201,8 @@ def main():
                 selected_day=1,
                 start_hour=start_hour,
                 end_hour=end_hour,
-                acquistion_speed_fps=3,
-                processing_speed_fps=4,
+                acquistion_speed_fps=20,
+                processing_speed_fps=30,
                 seed=SEED, 
                 state_content=state_content, 
                 random_reset=True, 
@@ -200,7 +212,16 @@ def main():
                 latent_size=args.latent_size,
                 train_days=args.train_days,
                 start_threshold=args.start_thr,
-                prevision_noise_amount=args.prevision_noise)
+                prevision_noise_amount=args.prevision_noise,
+                battery_wh=battery_wh,
+                only_day_acquisition=args.only_day_acquisition,
+                battery_weight=args.battery_weight,
+                device_idle_energy_w=args.device_idle_energy_w,
+                device_full_energy_w=args.device_full_energy_w,
+                buffer_weight=args.buffer_weight,
+                random_day_switch=args.random_day_switch,
+                discrete_action=args.discrete_action,
+                reward_shape=args.reward_shape)
             if env_id == 0:
                 log_path = os.path.join(args.run_folder, f"monitor_{env_id}")
                 env = Monitor(env, log_path)
@@ -226,7 +247,16 @@ def main():
                         latent_size=args.latent_size,
                         train_days=args.train_days,
                         start_threshold=args.start_thr,
-                        prevision_noise_amount=args.prevision_noise)
+                        prevision_noise_amount=args.prevision_noise,
+                        battery_wh=battery_wh,
+                        only_day_acquisition=args.only_day_acquisition,
+                        battery_weight=args.battery_weight,
+                        device_idle_energy_w=args.device_idle_energy_w,
+                        device_full_energy_w=args.device_full_energy_w,
+                        buffer_weight=args.buffer_weight,
+                        random_day_switch=False,
+                        discrete_action=args.discrete_action,
+                        reward_shape=args.reward_shape)
 
     if args.lr_decay is None:
         lr = args.lr
@@ -255,7 +285,9 @@ def main():
                             n_steps = args.update_steps,
                             batch_size=256,
                             vf_coef=0.5,
-                            clip_range_vf=linear_schedule(0.5,0.3,end_value=0.1),
+                            clip_range=0.1,
+                            #clip_range_vf=linear_schedule(0.5,0.3,end_value=0.1),
+                            gamma=args.gamma,
     )
     elif args.alg == "a2c":
         alg_entry = partial(A2C,
@@ -282,13 +314,13 @@ def main():
     )
     if args.use_embed_prev_day and args.forecast_steps!=args.latent_size:
         policy_kwargs = dict(
-            net_arch=[args.layer_width,args.layer_width],
+            net_arch=[args.layer_width] * args.layer_depth,
             features_extractor_class=ForecastEmbedded,
             features_extractor_kwargs=extractor_kwargs
         )
     else:
         policy_kwargs = dict(
-            net_arch=[args.layer_width,args.layer_width],
+            net_arch=[args.layer_width] * args.layer_depth,
         )
     print("Network", policy_kwargs)
     model = alg_entry(
@@ -345,6 +377,7 @@ def main():
             model = RecurrentPPO.load(path_to_load)
         
     def print_day_img(fields:list[dict], datetimes:list, titles:list[str], path:str|list[str]):
+        import matplotlib.dates as mdates
         plt.rcParams.update({'font.size': 14}) # Scegli un valore più grande, ad esempio 14 o 16
         plt.rcParams['axes.labelsize'] = 16 # Aumenta solo le etichette degli assi (Energy, Time Step)
         plt.rcParams['legend.fontsize'] = 14 # Aumenta solo la dimensione della legenda
@@ -355,9 +388,9 @@ def main():
         plt.rcParams['xtick.major.width'] = WIDTH
         plt.rcParams['ytick.major.width'] = WIDTH
 
-        fig, axs = plt.subplots(figsize=(12, 7), nrows=len(fields))
+        fig, axs = plt.subplots(figsize=(14, 8), nrows=len(fields), squeeze=False)
         for i in range(len(fields)):
-            ax = axs[i]
+            ax = axs[i, 0]
             for f_name in fields[i].keys():
                 #print("PRE",titles[i],"Field",f_name,"DT",len(datetimes[i]), "RL",len(fields[i][f_name]))
                 if  len(datetimes[i]) > len(fields[i][f_name]):
@@ -369,9 +402,20 @@ def main():
             ax.legend(loc="upper left")
             ax.grid(True)
             ax.set_title(titles[i])
-            ax.set_xticks(ax.get_xticks()[::12])
+            
+            # Format X-axis based on data type
+            import datetime as dt_module
+            if len(dt) > 0 and isinstance(dt[0], (dt_module.datetime, dt_module.date)):
+                ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m %H:%M'))
+                ax.set_xlim(left=dt[0], right=dt[-1])
+            else:
+                ax.set_xticks(ax.get_xticks()[::12])
+                ax.set_xlim(left=0)
+                
             ax.set_xlabel("Time")
-            ax.set_xlim(left=0)
+            
+        fig.autofmt_xdate()
         plt.tight_layout()
         #tikzplotlib.save("test.tex")
         if type(path)==list:
@@ -381,381 +425,73 @@ def main():
             plt.savefig(path)
         #plt.show()
         plt.close(fig)
-
-
-    
-    #Day 19 optimo di ILP è meglio il RL
-    max_days = len(solar2025.values)//(24*60//5)
-    progress_bar = tqdm(range(max_days))
-    #progress_bar = tqdm(range(20,60))#
+    max_days = 7#len(solar2025.values)//(24*60//5)
     failed_days = 0
-    needed_views = ["Battery","Solar","Hour", "Processing","Memory","Sunset","Hour Minute" ,"Opt Action","Opt Buffer", "Opt Batt", "Images"]
-    optimal_processed_images_per_day: list[tuple[int,int]] = [] #[Opt, RL]
-    fleassible_processed_images_per_day: list[tuple[int,int]] = [] #[Opt, RL]
-    all_processed_images_per_day: list[tuple[int,int]] = [] #[Opt, RL]    
     processed_steps = 0
-    is_fleassibles = []
-    is_optimals = []
     inference_total_time_s = 0
     step_total_time_s = 0
 
-    for d in progress_bar:
-        test_obs, info = test_env.reset(options={"norandom":True, "day":d})
-        fields = {}
-        for f in info["fields"]:
-            fields[f]=[]
-        fields["Processing"]=[]
-        datetimes = []
-        start_battery_perc = test_obs[0]
-        processed_steps_per_day = 0
-        captured_images = []
-        fields["Solar"].append(test_obs[1])
-        captured_images.append(test_env.acquisition_speed_fps*test_env.step_size_s)
+    # Accumulate data across all days for a single continuous plot
+    all_actions = []
+    all_battery = []
+    all_solar = []
+    all_buffer = []
+    all_datetimes = []
 
-        while True:
-            start_time = time()
-            action,_ = model.predict(test_obs, deterministic=True)
-            inference_total_time_s += (time()-start_time)
-            start_time = time()
-            test_obs, reward, done, terminated, info = test_env.step(action)
-            step_total_time_s += (time() - start_time)
-            processed_steps += 1
-            processed_steps_per_day += 1
-            if done and terminated==False:
-                failed_days += 1
-            if done:
-                break
-            for value,name in list(zip(test_obs, fields.keys())):
-                fields[name].append(value.item())
-            if "Processing" in fields.keys(): fields["Processing"].append(info["cons"])
-            datetimes.append(info["time"])
-            captured_images.append(test_obs[info["fields"].index("Images")]*test_env.acquisition_speed_fps*test_env.step_size_s)
+    # Override terminated_days so the env runs continuously for max_days
+    test_env.terminated_days = max_days
+    test_obs, info = test_env.reset(options={"norandom":True, "day":0})
+    all_solar.append(test_obs[1])
 
-        
-        """
+    while processed_steps < (30*24*60//5):
+        start_time = time()
+        action,_ = model.predict(test_obs, deterministic=True)
+        inference_total_time_s += (time()-start_time)
+        start_time = time()
+        test_obs, reward, done, terminated, info = test_env.step(action)
+        step_total_time_s += (time() - start_time)
+        processed_steps += 1
+
+        # Collect data
+        for value, name in list(zip(test_obs, info["fields"])):
+            if name == "Battery":
+                all_battery.append(value.item())
+            elif name == "Solar":
+                all_solar.append(value.item())
+            elif name == "Memory":
+                all_buffer.append(value.item())
+        if "cons" in info:
+            all_actions.append(info["cons"])
+        all_datetimes.append(info["time"])
+
         if done and terminated==False:
-            # I need to get solars untill the end of the day
-            time_s = test_env.time_s
-            while True:
-                solar_j = test_env.solar.get_solar_w(time_s)*test_env.step_size_s
-                if solar_j > 0:
-                    captured_images.append(test_env.acquisition_speed_fps*test_env.step_size_s)
-                    fields["Solar"].append(solar_j/(test_env.solar.max_power_w*test_env.step_size_s))
-                else:
-                    break
-                time_s += test_env.step_size_s
-        """
-        
-        solar_profiles = list(map(lambda x:x*test_env.solar.max_power_w*test_env.step_size_s, fields["Solar"]))
-        #print("Battery starts a at",start_battery)
-        optimal_prs, optimal_buff, optimal_batt, is_fleassible, is_optimal = find_optimal_list(
-                solar_profiles,
-                captured_images=captured_images,
-                battery_start_percentage=start_battery_perc,
-                max_buffer=test_env.max_buffer_size,
-                max_battery_j=test_env.battery_max_j,
-                e_idle_for_step_j=test_env.energy_for_idle_step_j,
-                e_processing_for_img_j=test_env.energy_for_image_processing_j
-            )
-        #print(len(optimal_batt),len(optimal_prs),len(optimal_buff),len(captured_images))
-        # sanity checks
-        assert len(solar_profiles) == len(captured_images), f"len mismatch solar={len(solar_profiles)} cap={len(captured_images)}"
+            failed_days += 1
+        if done:
+            break
 
-        # Simulate ILP schedule on a fresh env instance to validate feasibility and metric equivalence
-        def simulate_ilp_schedule(prs:list[int], day:int):
-            sim_env = EnvBeeDay(test_env.solar,
-                                step_s=test_env.step_size_s,
-                                selected_day=test_env.selected_day,
-                                start_hour=test_env.start_hour,
-                                end_hour=test_env.end_hour,
-                                acquistion_speed_fps=test_env.acquisition_speed_fps,
-                                processing_speed_fps=test_env.processing_speed_fps,
-                                seed=SEED,
-                                state_content=test_env.state_content,
-                                random_reset=False,
-                                terminated_days=test_env.terminated_days,
-                                forecast_steps=test_env.forecast_steps,
-                                choose_forecast=test_env.choose_forecast,
-                                latent_size=test_env.latent_size,
-                                train_days=test_env.train_days,
-                                start_threshold=test_env.start_threshold,
-                                prevision_noise_amount=test_env.prevision_noise_amount)
-            # reset to same day and battery level
-            obs,_ = sim_env.reset(options={"norandom":True, "day":day})
-            # set battery to same initial fraction if test_env.reset used that
-            sim_env.battery_curr_j = start_battery_perc*sim_env.battery_max_j
-            # apply schedule (convert prs -> action fraction per step)
-            prs_sum = 0
-            for i,p in enumerate(prs):
-                proc_frac = 0.0
-                processable = sim_env.processing_speed_fps * sim_env.step_size_s
-                if processable > 0:
-                    proc_frac = min(1.0, p / processable)
-                action = [proc_frac]
-                #print(f"Batt:",sim_env.battery_curr_j, optimal_batt[i])
-                _, _, done, _, info = sim_env.step(action)
-                prs_sum += p
-                opt_img = captured_images[min(i+1,len(captured_images)-1)]
-                opt_buf = optimal_buff[min(i+1,len(optimal_buff)-1)]
-                #print("Compare",i,p,prs_sum,"Images",info["images"],"=",opt_img, "Buff:",sim_env.buffer_length,"=",opt_buf)
-                if done:
-                    break
-            return sim_env.processed_images, sim_env.buffer_length, sim_env.battery_curr_j
+    # Generate single continuous plot
+    if args.run_folder:
+        filename = os.path.join(args.run_folder,"test_images")
+        os.makedirs(filename, exist_ok=True)
+        filename_png = os.path.join(filename, "continuous.png")
+        filename_pdf = os.path.join(filename, "continuous.pdf")
 
-        ilp_processed, ilp_buffer, ilp_batt = simulate_ilp_schedule(optimal_prs, d)
-        ilp_sum = int(sum(optimal_prs))
-        if ilp_processed != ilp_sum:
-            print(f"ILP schedule mismatch: sum(prs)={ilp_sum} but env simulation processed={ilp_processed} (buffer={ilp_buffer}, batt_j={ilp_batt})")
-        # else:
-        #     print(f"ILP schedule validated in-sim: processed={ilp_processed}, buffer={ilp_buffer}, batt_j={ilp_batt}")
-
-        if is_fleassible:
-            processed_imgs_opt = max(0,sum(optimal_prs))
-        else:            
-            processed_imgs_opt = 0
-        optimal_prs = optimal_prs[:-1]
-        fields["Opt Action"] = list(map(lambda x:max(0,x/(test_env.processing_speed_fps*test_env.step_size_s)), optimal_prs))
-        fields["Opt Buffer"] = list(map(lambda x:x/test_env.max_buffer_size, optimal_buff))[:len(optimal_prs)]
-        fields["Images"] = list(map(lambda x:x/(test_env.acquisition_speed_fps*test_env.step_size_s), captured_images))[:len(optimal_prs)]
-        fields["Opt Batt"] = list(map(lambda x:x/(test_env.battery_max_j), optimal_batt))[:len(optimal_prs)]
-        is_fleassibles.append(is_fleassible)
-        is_optimals.append(is_optimal)
-
-        if is_optimal:
-            optimal_processed_images_per_day.append((processed_imgs_opt, test_env.processed_images))
-        if is_fleassible:
-            fleassible_processed_images_per_day.append((processed_imgs_opt, test_env.processed_images))
-        all_processed_images_per_day.append((processed_imgs_opt, test_env.processed_images))
-
-        #print("day",d,is_optimal, "RL",test_env.processed_images, "Opt",processed_imgs_opt)
-        if test_env.processed_images > processed_imgs_opt and is_optimal:
-            print("RL is better than optimal solution | day", d, "RL", test_env.processed_images, "Opt", processed_imgs_opt, is_optimal)
-            print("RL steps", processed_steps_per_day, "Opt Steps", len(optimal_prs))
-            print("Batt steps",len(optimal_batt),len(fields["Battery"]))
-            # Detailed per-step comparison: replay RL deterministic and simulate ILP step-by-step
-            def trace_ilp(prs:list[int], day:int):
-                sim_env = EnvBeeDay(test_env.solar,
-                                    step_s=test_env.step_size_s,
-                                    selected_day=test_env.selected_day,
-                                    start_hour=test_env.start_hour,
-                                    end_hour=test_env.end_hour,
-                                    acquistion_speed_fps=test_env.acquisition_speed_fps,
-                                    processing_speed_fps=test_env.processing_speed_fps,
-                                    seed=SEED,
-                                    state_content=test_env.state_content,
-                                    random_reset=False,
-                                    terminated_days=test_env.terminated_days,
-                                    forecast_steps=test_env.forecast_steps,
-                                    choose_forecast=test_env.choose_forecast,
-                                    latent_size=test_env.latent_size,
-                                    train_days=test_env.train_days,
-                                    start_threshold=test_env.start_threshold,
-                                    prevision_noise_amount=test_env.prevision_noise_amount)
-                obs,_ = sim_env.reset(options={"norandom":True, "day":day})
-                sim_env.battery_curr_j = start_battery_perc*sim_env.battery_max_j
-                rows = []
-                prev = sim_env.processed_images
-                for p in prs:
-                    proc_frac = 0.0
-                    processable = sim_env.processing_speed_fps * sim_env.step_size_s
-                    if processable > 0:
-                        proc_frac = min(1.0, p / processable)
-                    action = [proc_frac]
-                    _, _, done, _, _ = sim_env.step(action)
-                    cur = sim_env.processed_images
-                    rows.append((int(p), int(cur - prev), sim_env.buffer_length, sim_env.battery_curr_j))
-                    prev = cur
-                    if done:
-                        break
-                return rows
-
-            def trace_rl(day:int):
-                sim_env = EnvBeeDay(test_env.solar,
-                                    step_s=test_env.step_size_s,
-                                    selected_day=test_env.selected_day,
-                                    start_hour=test_env.start_hour,
-                                    end_hour=test_env.end_hour,
-                                    acquistion_speed_fps=test_env.acquisition_speed_fps,
-                                    processing_speed_fps=test_env.processing_speed_fps,
-                                    seed=SEED,
-                                    state_content=test_env.state_content,
-                                    random_reset=False,
-                                    terminated_days=test_env.terminated_days,
-                                    forecast_steps=test_env.forecast_steps,
-                                    choose_forecast=test_env.choose_forecast,
-                                    latent_size=test_env.latent_size,
-                                    train_days=test_env.train_days,
-                                    start_threshold=test_env.start_threshold,
-                                    prevision_noise_amount=test_env.prevision_noise_amount)
-                obs,_ = sim_env.reset(options={"norandom":True, "day":day})
-                sim_env.battery_curr_j = start_battery_perc*sim_env.battery_max_j
-                rows = []
-                prev = sim_env.processed_images
-                while True:
-                    action, _ = model.predict(obs, deterministic=True)
-                    obs, _, done, _, _ = sim_env.step(action)
-                    cur = sim_env.processed_images
-                    rows.append((float(action[0]) if isinstance(action, (list,tuple,np.ndarray)) else float(action*sim_env.processing_speed_fps*sim_env.step_size_s),
-                                 int(cur - prev), sim_env.buffer_length, sim_env.battery_curr_j))
-                    prev = cur
-                    if done:
-                        break
-                return rows
-
-            ilp_rows = trace_ilp(optimal_prs, d)
-            rl_rows = trace_rl(d)
-
-            # Align lengths and print mismatch steps
-            max_len = max(len(ilp_rows), len(rl_rows))
-            import csv
-            csv_path = None
-            if args.run_folder:
-                csv_path = os.path.join(args.run_folder, f"debug_day_{d}.csv")
-            else:
-                csv_path = f"debug_day_{d}.csv"
-            with open(csv_path, "w", newline="") as f:
-                w = csv.writer(f)
-                w.writerow(["step", "Solar", "ilp_intended_p", "ilp_processed", "ilp_buffer", "ilp_batt_j",
-                            "rl_action_frac", "rl_processed", "rl_buffer", "rl_batt_j"])
-                for i in range(max_len):
-                    ilp = ilp_rows[i] if i < len(ilp_rows) else (0,0,0,0.0)
-                    rl = rl_rows[i] if i < len(rl_rows) else (0.0,0,0,0.0)
-                    solar = solar_profiles[i]
-                    w.writerow([i, solar, ilp[0], ilp[1], ilp[2], ilp[3], rl[0], rl[1], rl[2], rl[3]])
-
-            print("Detailed trace saved to", csv_path)
-            # quick summary: steps where RL processed more than ILP
-            extra_steps = []
-            for i in range(min(len(ilp_rows), len(rl_rows))):
-                if rl_rows[i][1] > ilp_rows[i][1]:
-                    extra_steps.append((i, ilp_rows[i][1], rl_rows[i][1], ilp_rows[i][3], rl_rows[i][3]))
-            if extra_steps:
-                print("Steps where RL processed more than ILP (step, ilp_proc, rl_proc, ilp_batt_j, rl_batt_j):")
-                #for s in extra_steps[:20]:
-                #    print(s)
-            else:
-                print("No per-step RL>ILP; difference likely due to extra steps at end or alignment issues.")
-            print("BATT RL  MAX", max(fields["Battery"]), "MIN", min(fields["Battery"]))
-            print("BATT OPT MAX", max(fields["Opt Batt"]), "MIN", min(fields["Opt Batt"]))
-            print("BUFF RL  MAX", max(fields["Memory"]), "MIN", min(fields["Memory"]))
-            print("BUFF OPT MAX", max(fields["Opt Buffer"]), "MIN", min(fields["Opt Buffer"]))
-            #break
-
-        if args.run_folder:
-            filename = os.path.join(args.run_folder,"test_images")
-            os.makedirs(filename, exist_ok=True)
-            filename_png = os.path.join(filename, f"{d}.png")
-            filename_pdf = os.path.join(filename, f"{d}.pdf")
-            #save_plot(fields, filename, views=needed_views, x_values=None)
-            day_fields = []
-            day_fields.append({ # Optimal
-                "Action":fields["Opt Action"],
-                "Battery":fields["Opt Batt"],
-                "Solar":fields["Solar"][:len(fields["Opt Action"])],
-                "Buffer":fields["Opt Buffer"],
-                "Images":fields["Images"],
-            })
-            day_fields.append({ # RL
-                "Action":fields["Processing"],
-                "Battery":fields["Battery"],
-                "Solar":fields["Solar"][:len(fields["Processing"])],
-                "Buffer":fields["Memory"],
-                "Images":fields["Images"],
-            })
-            #print("DT before add",len(datetimes))
-            while len(datetimes) < len(fields["Solar"]):
-                last_dt:datetime = datetimes[-1]
-                datetimes.append(last_dt + timedelta(minutes=5))
-            datetimes = list(map(lambda x:x.strftime("%H:%M"), datetimes))
-
-            #print("DT after add",len(datetimes))
-            name = "Not feasible"
-            if is_optimal:
-                name = "Optimal"
-            elif is_fleassible:
-                name = "Feasible"
-            print_day_img(day_fields, [datetimes, datetimes], [name, "RL"], [filename_png,filename_pdf])
-
-        progress_bar.set_postfix({
-            "Opt":is_fleassible,
-            "Processed RL":test_env.processed_images,
-            "Processed Opt":processed_imgs_opt,
-            "Failed":failed_days,
-            "Steps RL": processed_steps_per_day,
-            "Steps Opt": len(solar_profiles)
+        min_len = min(len(all_actions), len(all_battery), len(all_solar), len(all_buffer))
+        day_fields = []
+        day_fields.append({
+            "Action": all_actions[:min_len],
+            "Battery": all_battery[:min_len],
+            "Solar": all_solar[:min_len],
+            "Buffer": all_buffer[:min_len],
         })
+        print_day_img(day_fields, [all_datetimes[:min_len]], ["RL"], [filename_png, filename_pdf])
+        print(f"Plot saved to {filename_png}")
 
-    print("Only Fleassible")
-    print("\tRL sum",sum(list(map(lambda x:x[1], fleassible_processed_images_per_day))))
-    print("\tRL AVG",mean(list(map(lambda x:x[1], fleassible_processed_images_per_day))))
-    print("\tILP sum",sum(list(map(lambda x:x[0], fleassible_processed_images_per_day))))
-    print("\tILP AVG",mean(list(map(lambda x:x[0], fleassible_processed_images_per_day))))
-    print("\tILP vs RF avg efficiency", mean(list(map(lambda x:x[1]/x[0], fleassible_processed_images_per_day))))
-    print()
-    print("Only Optimal")
-    print("\tRL sum", sum(list(map(lambda x:x[1], optimal_processed_images_per_day))))
-    print("\tRL avg", mean(list(map(lambda x:x[1], optimal_processed_images_per_day))))
-    print("\tILP sum", sum(list(map(lambda x:x[0], optimal_processed_images_per_day))))
-    print("\tILP avg", mean(list(map(lambda x:x[0], optimal_processed_images_per_day))))
-    print("\tILP vs RF avg efficiency", mean(list(map(lambda x:x[1]/x[0], optimal_processed_images_per_day))))
-    print()
     print("Early shutdown", failed_days)
     print("Processed steps",processed_steps)
+    print("Processed images", test_env.processed_images)
     print("AVG inference time (ms)",1000*inference_total_time_s/processed_steps)
     print("AVG step time (ms)",1000*step_total_time_s/processed_steps)
-
-    print()
-    print("All")
-    print("\tRL is equal to ILP for",len(list(filter(lambda x:x[0]==x[1],all_processed_images_per_day))))
-    print("\tRL is > to ILP for",len(list(filter(lambda x:x[0]<x[1],all_processed_images_per_day))))
-    print("\tRL is < to ILP for",len(list(filter(lambda x:x[0]>x[1],all_processed_images_per_day))))
-    worste_days = list(filter(lambda x:x[0]>x[1],all_processed_images_per_day))
-    diff = list(map(lambda x:x[0]-x[1],worste_days))
-    print("\tError Mean Worste",mean(diff),"Std dev:",stdev(diff))
-    best_days = list(filter(lambda x:x[0]<x[1],all_processed_images_per_day))
-    diff = list(map(lambda x:x[0]-x[1],best_days))
-    print("\tError Mean Best",mean(diff),"Std dev:",stdev(diff))
-    print()
-    print("Optimal")
-    print("\tRL is equal to ILP for",len(list(filter(lambda x:x[0]==x[1],optimal_processed_images_per_day))))
-    print("\tRL is > to ILP for",len(list(filter(lambda x:x[0]<x[1],optimal_processed_images_per_day))))
-    print("\tRL is < to ILP for",len(list(filter(lambda x:x[0]>x[1],optimal_processed_images_per_day))))
-    worste_days = list(filter(lambda x:x[0]>x[1],optimal_processed_images_per_day))
-    diff = list(map(lambda x:x[0]-x[1],worste_days))
-    print("\tError Mean",mean(diff),"Std dev:",stdev(diff))
-
-    if args.run_folder:
-        rl_results = list(map(lambda x:x[1], all_processed_images_per_day))
-        opt_results = list(map(lambda x:x[0], all_processed_images_per_day))
-        max_value_per_day = max(opt_results)
-        def custom_plot(ax):
-            for i in range(len(is_optimals)):
-                optimal = is_optimals[i]
-                fleassible = is_fleassibles[i]
-                if optimal or fleassible:
-                    color = "blue"
-                    if optimal and fleassible:
-                        if all_processed_images_per_day[i][0]<all_processed_images_per_day[i][1]:
-                            color = "red"
-                        else:
-                            color = "green"
-                    label = "Optimal" if optimal else "Sub-Optimal"
-                    ax.axvspan(i, i+1, facecolor=color, alpha=0.2, label=label)
-                    #ax.fill_between(i,0,1,facecolor=color)
-        rl = list(map(lambda x:x/max_value_per_day,rl_results))
-        opt = list(map(lambda x:x/max_value_per_day,opt_results))
-        rl.append(rl[-1])
-        opt.append(opt[-1])
-        data = {
-            "RL":rl,
-            "Opt":opt,
-        }
-        paths = [os.path.join(args.run_folder,"run_per_day.png"),os.path.join(args.run_folder,"run_per_day.pdf")]
-        custom_linestyle={
-                "RL":"-",#(0,(1,1)),
-                "Opt":"--"#(1,(1,1)),
-        }
-        save_plot(data, paths, custom_linestyle=custom_linestyle, custom_lambda=custom_plot, y_label="Processed images", x_label="Days")
 
     
     print("Measuring flops")

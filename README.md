@@ -1,3 +1,7 @@
+BEST UNTILL NOW
+```bash
+python -u main.py --gpu --use_solar --use_hour_minute --steps 2000000 --update_steps 2048 --alg ppo --lr 0.0003 --term_days 2 --test_year 2025 --n_env 10 --layer_width 64 --layer_depth 3 --lr_decay lin --train_days 350 --autostart --start_thr 0 --gamma 0.999 --device_idle_energy_w 2 --device_full_energy_w 8 --term_days 2 --reward_shape 1 --buffer_weight 0.3 --battery_weight 0.7
+```
 # Reinforcement Learning Scheduler for Solar-Powered Edge Devices
 ## Authors :pencil2:
 - Luca Giovannesi
@@ -40,3 +44,13 @@ For each run is created a folder in `runs`, containing all the plots of the exec
 - **main.py** contains the training and evaluation code
 - **ilp_solver.py** contains the code to find the optimal solutions using the ILP
 - **lib/environment.py** contains the RL Environment
+
+## CSV filter
+
+If you want to create a smaller CSV with only the columns used by `src/lib/solar/solar.py`, run:
+
+```bash
+python src/filter_solar_csv.py solcast2025.csv
+```
+
+This generates `solcast2025_solar_only.csv` in the same folder as the input file. You can also pass an explicit output path as the second argument.
