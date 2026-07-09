@@ -361,6 +361,30 @@ class EnvBeeDay(gym.Env):
             h+=m/60
             arr.append(h/24)
             fields.append("Sunset")
+        if self.state_content & StateContent.SOLAR_HORIZON:
+            # Multi-horizon forecast: expected solar in next 1h, 3h, 6h
+            horizons_s = [1*3600, 3*3600, 6*3600]
+            max_horizon_s = horizons_s[-1]
+            accumulated = 0.0
+            horizon_idx = 0
+            horizon_values = []
+            for t in range(self.time_s, self.time_s + max_horizon_s, self.step_size_s):
+                solar_w = self.solar.get_solar_w(t)
+                if solar_w < 0:
+                    solar_w = 0.0
+                accumulated += solar_w * self.step_size_s
+                elapsed = t - self.time_s + self.step_size_s
+                if horizon_idx < len(horizons_s) and elapsed >= horizons_s[horizon_idx]:
+                    max_energy = self.solar.max_power_w * horizons_s[horizon_idx]
+                    horizon_values.append(accumulated / max_energy if max_energy > 0 else 0.0)
+                    horizon_idx += 1
+            # Fill remaining horizons if data ended early
+            while len(horizon_values) < len(horizons_s):
+                max_energy = self.solar.max_power_w * horizons_s[len(horizon_values)]
+                horizon_values.append(accumulated / max_energy if max_energy > 0 else 0.0)
+            for i, label in enumerate(["1h", "3h", "6h"]):
+                arr.append(horizon_values[i])
+                fields.append(f"Solar {label}")
         if self.state_content & StateContent.EMBEDDED_CURRENT_DAY:
             day = self.solar.get_datetime(self.time_s).timetuple().tm_yday
             values = self.solar.get_day_values(day)
@@ -370,7 +394,8 @@ class EnvBeeDay(gym.Env):
                 values.insert(0,0)
         if self.state_content & StateContent.EMBEDDED_NEXT_DAY or \
             self.state_content & StateContent.EMBEDDED_PREV_NEXT_DAY or \
-            self.state_content & StateContent.QUANTIZED_PREV_DAY:
+            self.state_content & StateContent.QUANTIZED_PREV_DAY or \
+            self.state_content & StateContent.QUANTIZED_DAY:
             today = self.solar.get_datetime(self.time_s).day
             # def f(t):
             #     #forecast_time_s = self.time_s+self.step_size_s*i

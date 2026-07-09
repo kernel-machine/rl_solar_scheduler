@@ -36,6 +36,7 @@ class StateContent(IntEnum):
     QUANTIZED_PREV_DAY              = 1<<19
     EMBEDDED_PREV_NEXT_DAY          = 1<<20
     IMAGES                          = 1<<21
+    SOLAR_HORIZON                   = 1<<22
 
 
 def emphasize_diff_sigmoid(x, sharpness=10):

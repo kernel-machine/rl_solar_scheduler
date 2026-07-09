@@ -57,6 +57,7 @@ def main():
     parser.add_argument("--use_embed_prev_day", default=False, action="store_true")
     parser.add_argument("--use_quantize_day", default=False, action="store_true")
     parser.add_argument("--use_quantize_prev_day", default=False, action="store_true")
+    parser.add_argument("--use_solar_horizon", default=False, action="store_true")
     parser.add_argument("--layer_width", default=64, type=int)
     parser.add_argument("--layer_depth", default=2, type=int)
     parser.add_argument("--latent_size", default=24, type=int)
@@ -179,6 +180,8 @@ def main():
         state_content ^= StateContent.EMBEDDED_PREV_NEXT_DAY
     if args.use_images:
         state_content ^= StateContent.IMAGES
+    if args.use_solar_horizon:
+        state_content ^= StateContent.SOLAR_HORIZON
 
     state_content ^= StateContent.BUFFER
 
