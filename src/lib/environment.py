@@ -35,7 +35,8 @@ class EnvBeeDay(gym.Env):
                  buffer_weight:float = 1.0,
                  random_day_switch:bool = False,
                  discrete_action:bool = False,
-                 reward_shape:int = 1
+                 reward_shape:int = 1,
+                 buffer_incoming:bool = False
                    ):
         self.state_content = state_content
         self.random_reset = random_reset
@@ -58,6 +59,7 @@ class EnvBeeDay(gym.Env):
         self.random_day_switch = random_day_switch
         self.discrete_action = discrete_action
         self.reward_shape = reward_shape
+        self.buffer_incoming = buffer_incoming
 
         self.rng = random.Random(seed)
         torch.manual_seed(seed)
@@ -168,6 +170,12 @@ class EnvBeeDay(gym.Env):
         #     captured_images = 0
         # else:
         captured_images = self.acquisition_speed_fps * self.step_size_s
+
+        # Simulate incoming images offloaded from other nodes
+        incoming_images = 0
+        if self.buffer_incoming and self.rng.random() < 0.002:
+            incoming_images = int(self.rng.uniform(0.05, 0.25) * self.max_buffer_size)
+            self.buffer_length += incoming_images
 
         processable_images = self.processing_speed_fps * self.step_size_s # Processable images must be > captured
 

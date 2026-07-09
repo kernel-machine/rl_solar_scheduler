@@ -88,6 +88,7 @@ def main():
     parser.add_argument("--random_day_switch", default=False, action="store_true")
     parser.add_argument("--discrete_action", default=False, action="store_true")
     parser.add_argument("--reward_shape", type=int, default=1)
+    parser.add_argument("--buffer_incoming", default=False, action="store_true")
 
     args = parser.parse_args()
     SEED = 42
@@ -224,7 +225,8 @@ def main():
                 buffer_weight=args.buffer_weight,
                 random_day_switch=args.random_day_switch,
                 discrete_action=args.discrete_action,
-                reward_shape=args.reward_shape)
+                reward_shape=args.reward_shape,
+                buffer_incoming=args.buffer_incoming)
             if env_id == 0:
                 log_path = os.path.join(args.run_folder, f"monitor_{env_id}")
                 env = Monitor(env, log_path)
@@ -259,7 +261,8 @@ def main():
                         buffer_weight=args.buffer_weight,
                         random_day_switch=False,
                         discrete_action=args.discrete_action,
-                        reward_shape=args.reward_shape)
+                        reward_shape=args.reward_shape,
+                        buffer_incoming=args.buffer_incoming)
 
     if args.lr_decay is None:
         lr = args.lr
