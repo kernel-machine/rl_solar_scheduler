@@ -36,7 +36,14 @@ class EnvBeeDay(gym.Env):
                  random_day_switch:bool = False,
                  discrete_action:bool = False,
                  reward_shape:int = 1,
-                 buffer_incoming:bool = False
+                 buffer_incoming:bool = False,
+                 nn_model=None,
+                 nn_lookback:int = 96,
+                 nn_horizon:int = 24,
+                 nn_min_val:float = 0.0,
+                 nn_max_val:float = 1.0,
+                 probabilistic_forecast:bool = False,
+                 nn_use_log1p:bool = False
                    ):
         self.state_content = state_content
         self.random_reset = random_reset
@@ -60,6 +67,16 @@ class EnvBeeDay(gym.Env):
         self.discrete_action = discrete_action
         self.reward_shape = reward_shape
         self.buffer_incoming = buffer_incoming
+
+        # NN prediction parameters
+        self.nn_model = nn_model
+        self.nn_lookback = nn_lookback
+        self.nn_horizon = nn_horizon
+        self.nn_min_val = nn_min_val
+        self.nn_max_val = nn_max_val
+        self.probabilistic_forecast = probabilistic_forecast
+        self.nn_use_log1p = nn_use_log1p
+        self.solar_history = []  # circular buffer for LSTM lookback
 
         self.rng = random.Random(seed)
         torch.manual_seed(seed)
@@ -128,8 +145,8 @@ class EnvBeeDay(gym.Env):
                 self.battery_curr_j += solar_energy_j
         elif self.start_hour < 0 and self.start_threshold <= 0:
             # random start hour
-            self.start_hour = self.rng.randint(0,23)
-            self.time_s = (day*24+self.start_hour)*60*60
+            actual_start_hour = 7 if (options is not None and options.get("norandom") == True) else self.rng.randint(0,23)
+            self.time_s = (day*24+actual_start_hour)*60*60
         else:
             self.time_s = (day*24+self.start_hour)*60*60
 
@@ -138,6 +155,33 @@ class EnvBeeDay(gym.Env):
         self.haversted_energy_j = self.battery_curr_j
         self.elapsed_time_s = 0
         
+        # Pre-fill solar history for NN prediction to eliminate initial episode warm-up
+        self.solar_history = []
+        if self.state_content & StateContent.NN_PREDICTION and self.nn_model is not None:
+            for i in range(self.nn_lookback, 0, -1):
+                past_t = self.time_s - i * self.step_size_s
+                past_solar_raw = max(0.0, self.solar.get_solar_w(past_t)) / self.solar.scale_factor
+                if self.nn_use_log1p:
+                    past_solar_raw = np.log1p(past_solar_raw)
+                
+                if self.nn_max_val > self.nn_min_val:
+                    past_scaled = (past_solar_raw - self.nn_min_val) / (self.nn_max_val - self.nn_min_val)
+                else:
+                    past_scaled = past_solar_raw
+                past_scaled = max(0.0, min(1.0, float(past_scaled)))
+                
+                dt = self.solar.get_datetime(past_t)
+                h = dt.hour + dt.minute / 60.0
+                sin_h = float(np.sin(2 * np.pi * h / 24.0))
+                cos_h = float(np.cos(2 * np.pi * h / 24.0))
+                
+                nn_input_size = getattr(self.nn_model, 'input_size', 3)
+                if nn_input_size == 3:
+                    feat = [past_scaled, sin_h, cos_h]
+                else:
+                    feat = [past_scaled]
+                self.solar_history.append(feat)
+
         obs, fields = self.__get_obs()
         return obs, {"fields":fields}
     
@@ -234,6 +278,16 @@ class EnvBeeDay(gym.Env):
             battery_penalty = self.battery_weight * max(0, 0.2 - battery_level)
             death_penalty = 10.0 if done else 0.0
             reward = processing_reward - buffer_penalty - battery_penalty - death_penalty
+        elif self.reward_shape == 5:
+            buffer_level = self.buffer_length / self.max_buffer_size
+            battery_level = self.battery_curr_j / self.battery_max_j
+            # Reward per processare le immagini è SCALATO in base alla batteria! 
+            # Se scende sotto il 20%, il processing non dà più nessun reward! (elimina il suicidio)
+            processing_reward = (processed_amount / processable_images) * max(0, (battery_level - 0.2) / 0.8)
+            buffer_penalty = self.buffer_weight * (buffer_level ** 2)
+            battery_penalty = self.battery_weight * max(0, 0.2 - battery_level) * 2.0
+            death_penalty = 10.0 if done else 0.0
+            reward = processing_reward - buffer_penalty - battery_penalty - death_penalty
         else:
             reward = 0
 
@@ -312,14 +366,7 @@ class EnvBeeDay(gym.Env):
             day_sun = self.solar.get_day_avg_w(day)/self.max_avg_day
             arr.append(day_sun)
             fields.append("Day avg")
-        if self.state_content & StateContent.SUN_REAL_PREDICTION:
-            energy_j = self.solar.get_real_future_prediction_j(self.time_s+when_m*60, self.step_size_s, windows_size_m)
-            if windows_size_m > 0:
-                energy_j /= self.solar.max_power_w*windows_size_m*60
-            else:
-                energy_j = 0.0
-            arr.append(energy_j)
-            fields.append("Sun real prediction")
+
         if self.state_content & StateContent.SUN_ESTIMATE_PREDICTION:
             lower_bound_energy_j, upper_bound_energy_j = self.solar.get_estimate_future_prediction_j(self.time_s+when_m*60, self.step_size_s, windows_size_m)
             # Normalize
@@ -444,6 +491,73 @@ class EnvBeeDay(gym.Env):
             for index,v in enumerate(values):
                 arr.append(v)
                 fields.append(f"Latent {index}")
+
+        # Real Prediction: append real future solar values to observation
+        if self.state_content & StateContent.SUN_REAL_PREDICTION:
+            for i in range(self.forecast_steps):
+                forecast_time_s = self.time_s + 3600 * i
+                v = self.solar.get_solar_w(forecast_time_s)
+                if v < 0:
+                    v = 0.0
+                v /= self.solar.max_power_w
+                arr.append(v)
+                fields.append(f"Real Pred {i}")
+
+        # NN Prediction: append predicted future solar values to observation
+        if self.state_content & StateContent.NN_PREDICTION and self.nn_model is not None:
+            # Update solar history buffer
+            current_solar_raw = max(0.0, self.solar.get_solar_w(self.time_s)) / self.solar.scale_factor
+            if self.nn_use_log1p:
+                current_solar_raw = np.log1p(current_solar_raw)
+                
+            # Scale to NN's training range
+            if self.nn_max_val > self.nn_min_val:
+                current_solar_scaled = (current_solar_raw - self.nn_min_val) / (self.nn_max_val - self.nn_min_val)
+            else:
+                current_solar_scaled = current_solar_raw
+            current_solar_scaled = max(0.0, min(1.0, float(current_solar_scaled)))
+
+            dt = self.solar.get_datetime(self.time_s)
+            h = dt.hour + dt.minute / 60.0
+            sin_h = float(np.sin(2 * np.pi * h / 24.0))
+            cos_h = float(np.cos(2 * np.pi * h / 24.0))
+
+            nn_input_size = getattr(self.nn_model, 'input_size', 3)
+            if nn_input_size == 3:
+                feature_vec = [current_solar_scaled, sin_h, cos_h]
+            else:
+                feature_vec = [current_solar_scaled]
+
+            self.solar_history.append(feature_vec)
+            # Keep only the last lookback values
+            if len(self.solar_history) > self.nn_lookback:
+                self.solar_history = self.solar_history[-self.nn_lookback:]
+            
+            if len(self.solar_history) >= self.nn_lookback:
+                # Run NN inference
+                with torch.no_grad():
+                    input_dim = len(feature_vec)
+                    history_tensor = torch.tensor(
+                        self.solar_history[-self.nn_lookback:], dtype=torch.float32
+                    ).reshape(1, self.nn_lookback, input_dim)
+                    nn_device = next(self.nn_model.parameters()).device
+                    history_tensor = history_tensor.to(nn_device)
+                    predicted = self.nn_model(history_tensor).cpu().numpy().flatten()
+                    if self.probabilistic_forecast:
+                        # Probabilistic models output (horizon * 3)
+                        # We extract only the P10 quantile (first element of each triplet) to give a pessimistic/safe forecast
+                        predicted = predicted.reshape(self.nn_horizon, 3)[:, 0]
+                    # Predictions are in [0,1] scaled range, clip them
+                    predicted = np.clip(predicted, 0.0, 1.0)
+                for idx_p, p_val in enumerate(predicted):
+                    arr.append(float(p_val))
+                    fields.append(f"NN Pred {idx_p}")
+            else:
+                # Not enough history yet, pad with zeros
+                pad_len = self.nn_horizon
+                for idx_p in range(pad_len):
+                    arr.append(0.0)
+                    fields.append(f"NN Pred {idx_p}")
 
         return np.array(arr,dtype=np.float32),fields
 

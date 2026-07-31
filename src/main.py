@@ -89,7 +89,16 @@ def main():
     parser.add_argument("--discrete_action", default=False, action="store_true")
     parser.add_argument("--reward_shape", type=int, default=1)
     parser.add_argument("--buffer_incoming", default=False, action="store_true")
-
+    parser.add_argument("--lstm_prediction", default=False, action="store_true", help="Enable LSTM solar prediction in observations")
+    parser.add_argument("--lstm_model", type=str, default="ghi_predictor_lstm.pth", help="Path to pre-trained LSTM model")
+    parser.add_argument("--tcn_prediction", default=False, action="store_true", help="Enable TCN solar prediction in observations")
+    parser.add_argument("--tcn_model", type=str, default="ghi_predictor_tcn.pth", help="Path to pre-trained TCN model")
+    parser.add_argument("--transformer_prediction", default=False, action="store_true", help="Enable Transformer solar prediction in observations")
+    parser.add_argument("--transformer_model", type=str, default="ghi_predictor_transformer.pth", help="Path to pre-trained Transformer model")
+    parser.add_argument("--probabilistic_forecast", default=False, action="store_true", help="Use probabilistic forecast (3 values per step)")
+    parser.add_argument("--nn_lookback", type=int, default=96, help="NN lookback window size")
+    parser.add_argument("--nn_horizon", type=int, default=24, help="NN prediction horizon")
+    parser.add_argument("--battery_ah", type=float, default=24.0, help="Battery capacity in ampere-hours")
     args = parser.parse_args()
     SEED = 42
 
@@ -183,6 +192,8 @@ def main():
         state_content ^= StateContent.IMAGES
     if args.use_solar_horizon:
         state_content ^= StateContent.SOLAR_HORIZON
+    if args.lstm_prediction or args.tcn_prediction or args.transformer_prediction:
+        state_content ^= StateContent.NN_PREDICTION
 
     state_content ^= StateContent.BUFFER
 
@@ -191,9 +202,69 @@ def main():
     panel_area_m2 = 2*0.55*0.51 #m2
     efficiency = 0.1426
     max_power_w = 80 #W
-    battery_wh = 24*12
+    battery_v = 12
+    battery_ah = args.battery_ah
+    battery_wh = battery_ah*battery_v
     solar2024 = Solar("../solcast2024_solar_only.csv", scale_factor=panel_area_m2*efficiency, max_power=max_power_w, enable_cache=True, prediction_accuracy=args.prediction_accuracy)
     solar2025 = Solar(f"../solcast{args.test_year}_solar_only.csv", scale_factor=panel_area_m2*efficiency, max_power=max_power_w, enable_cache=True, prediction_accuracy=args.prediction_accuracy)
+
+    # Load NN model if needed
+    nn_model_instance = None
+    nn_min_val = 0.0
+    nn_max_val = 1.0
+    nn_use_log1p = False
+    args.nn_prediction = args.lstm_prediction or args.tcn_prediction or args.transformer_prediction
+    if args.nn_prediction:
+        if args.lstm_prediction:
+            from lib.solar.prediction import GHIPredictorLSTM
+            model_path = args.lstm_model
+            model_class = GHIPredictorLSTM
+        elif args.tcn_prediction:
+            from lib.solar.prediction import GHIPredictorTCN
+            model_path = args.tcn_model
+            model_class = GHIPredictorTCN
+        else:
+            from lib.solar.prediction import GHIPredictorTransformer
+            model_path = args.transformer_model
+            model_class = GHIPredictorTransformer
+
+        scaling_path = model_path.replace('.pth', '_scaling.npz')
+        if os.path.exists(scaling_path):
+            scaling_data = np.load(scaling_path, allow_pickle=True)
+            nn_min_val = float(scaling_data['min_val'])
+            nn_max_val = float(scaling_data['max_val'])
+            nn_hidden_size = int(scaling_data['hidden_size'])
+            nn_num_layers = int(scaling_data['num_layers'])
+            nn_horizon = int(scaling_data['horizon'])
+            nn_lookback = int(scaling_data['lookback'])
+            nn_input_size = int(scaling_data['input_size']) if 'input_size' in scaling_data else 3
+            is_probabilistic = bool(scaling_data.get('probabilistic', False)) or args.probabilistic_forecast
+            nn_use_log1p = bool(scaling_data.get('use_log1p', False))
+            args.nn_horizon = nn_horizon
+            args.nn_lookback = nn_lookback
+            print(f"NN scaling: min={nn_min_val:.2f}, max={nn_max_val:.2f}, lookback={nn_lookback}, horizon={nn_horizon}, input_size={nn_input_size}, probabilistic={is_probabilistic}, log1p={nn_use_log1p}")
+        else:
+            nn_hidden_size = 64
+            nn_num_layers = 3
+            nn_input_size = 3
+            is_probabilistic = args.probabilistic_forecast
+            nn_use_log1p = False
+            print(f"Warning: scaling file {scaling_path} not found, using default parameters")
+        
+        model_output_size = args.nn_horizon * 3 if is_probabilistic else args.nn_horizon
+        args.forecast_steps_nn = args.nn_horizon # To pass to feature extractor (always horizon size now)
+        args.probabilistic_forecast = is_probabilistic
+
+        nn_model_instance = model_class(
+            input_size=nn_input_size, 
+            hidden_size=nn_hidden_size, 
+            num_layers=nn_num_layers, 
+            output_size=model_output_size
+        )
+        nn_model_instance.load_state_dict(torch.load(model_path, map_location='cpu', weights_only=True))
+        nn_model_instance.eval()
+        nn_model_instance.to(device)
+        print(f"NN model loaded from {model_path}")
 
     start_hour = -1 if args.autostart else 7
     end_hour = -1 if args.autostart else 18
@@ -226,7 +297,14 @@ def main():
                 random_day_switch=args.random_day_switch,
                 discrete_action=args.discrete_action,
                 reward_shape=args.reward_shape,
-                buffer_incoming=args.buffer_incoming)
+                buffer_incoming=args.buffer_incoming,
+                nn_model=nn_model_instance,
+                nn_lookback=args.nn_lookback,
+                nn_horizon=args.nn_horizon,
+                nn_min_val=nn_min_val,
+                nn_max_val=nn_max_val,
+                probabilistic_forecast=args.probabilistic_forecast,
+                nn_use_log1p=nn_use_log1p)
             if env_id == 0:
                 log_path = os.path.join(args.run_folder, f"monitor_{env_id}")
                 env = Monitor(env, log_path)
@@ -262,7 +340,14 @@ def main():
                         random_day_switch=False,
                         discrete_action=args.discrete_action,
                         reward_shape=args.reward_shape,
-                        buffer_incoming=args.buffer_incoming)
+                        buffer_incoming=args.buffer_incoming,
+                        nn_model=nn_model_instance,
+                        nn_lookback=args.nn_lookback,
+                        nn_horizon=args.nn_horizon,
+                        nn_min_val=nn_min_val,
+                        nn_max_val=nn_max_val,
+                        probabilistic_forecast=args.probabilistic_forecast,
+                        nn_use_log1p=nn_use_log1p)
 
     if args.lr_decay is None:
         lr = args.lr
@@ -313,17 +398,23 @@ def main():
                             )
         
     policy = "MlpLstmPolicy" if args.alg == "rec_ppo" else "MlpPolicy"
-    extractor_kwargs = dict(
-        normal_dim=test_env.observation_space.shape[0]-args.forecast_steps, 
-        forecast_dim=args.forecast_steps, 
-        latent_dim=args.latent_size
-    )
-    if args.use_embed_prev_day and args.forecast_steps!=args.latent_size:
+    
+    # We disable ForecastEmbedded for nn_prediction because PPO struggles to train a bottleneck 
+    # layer from scratch when the features have some noise. Feeding them directly to the MLP works much better.
+    use_forecast_extractor = args.use_embed_prev_day
+    if use_forecast_extractor and (args.forecast_steps != args.latent_size):
+        forecast_dim = args.forecast_steps
+        extractor_kwargs = dict(
+            normal_dim=test_env.observation_space.shape[0] - forecast_dim, 
+            forecast_dim=forecast_dim, 
+            latent_dim=args.latent_size
+        )
         policy_kwargs = dict(
             net_arch=[args.layer_width] * args.layer_depth,
             features_extractor_class=ForecastEmbedded,
             features_extractor_kwargs=extractor_kwargs
         )
+        print("Using ForecastEmbedded features extractor:", extractor_kwargs)
     else:
         policy_kwargs = dict(
             net_arch=[args.layer_width] * args.layer_depth,

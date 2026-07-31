@@ -25,10 +25,18 @@ class ForecastEmbedded(BaseFeaturesExtractor):
 
         self.normal_dim = normal_dim
         self.forecast_dim = forecast_dim
-        self.latent_encoder = torch.nn.Linear(forecast_dim, latent_dim)
+        
+        hidden_dim = 64
+        self.latent_encoder = torch.nn.Sequential(
+            torch.nn.Linear(forecast_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, latent_dim)
+        )
 
-        torch.nn.init.xavier_uniform_(self.latent_encoder.weight)
-        torch.nn.init.constant_(self.latent_encoder.bias, 0)
+        for module in self.latent_encoder.modules():
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.orthogonal_(module.weight, gain=1.414)
+                torch.nn.init.constant_(module.bias, 0.0)
 
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:

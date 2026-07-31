@@ -4,6 +4,7 @@ wandb
 __pycache__
 logs
 env
+local_env
 *.pdf
 *.png
 runs

@@ -9,6 +9,7 @@ class Solar:
     def __init__(self, csv_path: str, scale_factor: float = 1, max_power:int = 0, enable_cache = False, prediction_accuracy:float = 1):
         self.values = []
         self.max_power_w = max_power
+        self.scale_factor = scale_factor
         self.enable_cache = enable_cache
         self.cache = {}
         self.day_avg_cache = {}
@@ -47,20 +48,22 @@ class Solar:
                     self.start_time = delta.total_seconds()
                     self.start_datetime = dt
 
+        self.time_map = {int(v[0]): v[1] for v in self.values}
+
     def get_solar_w(self, time_s: int) -> int:
-        # print("Solar time:", time_s)
-        if self.enable_cache and str(time_s) in self.cache.keys():
-            return self.cache[str(time_s)]
+        time_int = int(time_s)
+        if time_int in self.time_map:
+            v = self.time_map[time_int]
+            v = min(self.max_power_w, v) if self.max_power_w > 0 else v
+            return max(v, 0)
+
         for i in range(len(self.values)):
             if self.values[i][0] == time_s:
                 v = self.values[i][1]
                 v = min(self.max_power_w,v) if self.max_power_w > 0 else v
                 v = max(v, 0)
-                if self.enable_cache:
-                    self.cache[str(time_s)]=v
                 return v
             elif i+1 < len(self.values) and self.values[i][0] < time_s and self.values[i+1][0] > time_s:
-                # print(f"Found: {self.values[i]}")
                 current_t = self.values[i][0]
                 next_t = self.values[i+1][0]
                 delta_second = next_t - current_t
@@ -68,11 +71,7 @@ class Solar:
                 fraction = delta_value / delta_second
                 v = self.values[i][1]+fraction*(time_s-current_t)
                 v = min(self.max_power_w,v) if self.max_power_w > 0 else v
-                v = max(v, 0)
-                if self.enable_cache:
-                    self.cache[str(time_s)]=v
-                return v
-        # print("Solar not found")
+                return max(v, 0)
         return -1
     
     def get_info(self, time_s: int, field:str):
